@@ -1,112 +1,110 @@
-import requests
-import subprocess
-import socket
-import time
+import asyncio
 import logging
+import requests
+import os
+import socket
 from bittensor import subtensor
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
-# Constants
-SUBVORTEX_URL = 'ws://subvortex.info:9944'
-FINNEY_NETWORK = 'finney'
-LOCAL_URL = 'ws://localhost:9944'
-CHECK_INTERVAL = 12  # seconds
-TIMEOUT = 10  # seconds for the connections
-DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/YOUR_WEBHOOK_URL'
+class FirewallManager:
+    def block_port(self):
+        # Block external access to port 9944, but allow localhost (127.0.0.1)
+        os.system("iptables -A INPUT -p tcp --dport 9944 ! -s 127.0.0.1 -j REJECT --reject-with tcp-reset")
 
-# Function to send Discord message
-def send_discord_message(message):
-    data = {"content": message}
-    logging.info(f"Sending Discord message: {message}")
-    # try:
-    #     requests.post(DISCORD_WEBHOOK_URL, json=data)
-    # except Exception as e:
-    #     logging.error(f"Failed to send Discord message: {e}")
+    def unblock_port(self):
+        # Unblock port 9944 to allow external access again
+        os.system("iptables -D INPUT -p tcp --dport 9944 ! -s 127.0.0.1 -j REJECT --reject-with tcp-reset")
 
-# Get the local IP address
-def get_local_ip():
-    try:
-        hostname = socket.gethostname()
-        return socket.gethostbyname(hostname)
-    except Exception as e:
-        logging.error(f"Failed to get local IP address: {e}")
-        return "Unknown"
+class SubtensorMonitor:
+    def __init__(self, discord_webhook_url):
+        self.firewall = FirewallManager()
+        self.discord_webhook_url = discord_webhook_url
+        self.local_address = "ws://127.0.0.1:9944"
+        self.finney_address = "finney"
+        self.subvortex_address = "ws://subvortex.info:9944"
+        self.block_behind_threshold = 2  # Threshold for block lagging
+        self.reset_script = "./reset_subtensor.sh"  # Path to the reset script
+        self.logger = logging.getLogger(__name__)
 
-# Function to get the block number
-def get_block_number(network_url):
-    try:
-        st = subtensor(network=network_url)
-        return st.block
-    except Exception as e:
-        logging.error(f"Error fetching block number from {network_url}: {e}")
-        return None
-# Function to get block number with a custom timeout
-def get_block_number_with_custom_timeout(network_url, timeout=TIMEOUT):
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(get_block_number, network_url)
+    async def get_block_number(self, network):
         try:
-            return future.result(timeout=timeout)
-        except TimeoutError:
-            logging.error(f"Timeout occurred while fetching block number from {network_url}")
-            return None
+            block = subtensor(network=network).block
+            return block
         except Exception as e:
-            logging.error(f"An error occurred: {e}")
+            self.report_to_discord(f"Error fetching block from {network}: {e}")
+            self.logger.exception(f"Error fetching block from {network}: {e}")
             return None
 
-# Function to apply firewall rule but allow localhost access
-def firewall_subtensor_allow_local():
-    # Block port 9944 for all IPs except localhost (127.0.0.1)
-    subprocess.run(["sudo", "iptables", "-A", "OUTPUT", "-p", "tcp", "--dport", "9944", "!", "-d", "127.0.0.1", "-j", "DROP"])
-    send_discord_message(f"Firewall applied to subtensor (blocking external access) at {get_local_ip()}")
+    async def fetch_all_blocks(self):
+        tasks = [
+            self.get_block_number(self.local_address),
+            self.get_block_number(self.finney_address),
+            self.get_block_number(self.subvortex_address)
+        ]
+        return await asyncio.gather(*tasks)
 
-# Function to remove firewall rule
-def remove_firewall():
-    subprocess.run(["sudo", "iptables", "-D", "OUTPUT", "-p", "tcp", "--dport", "9944", "!", "-d", "127.0.0.1", "-j", "DROP"])
-    send_discord_message(f"Firewall removed for subtensor at {get_local_ip()}")
+    async def monitor_subtensor(self):
+        is_firewalled = False
+        while True:
+            local_block, finney_block, subvortex_block = await self.fetch_all_blocks()
 
-# Function to reset the subtensor
-def reset_subtensor():
-    subprocess.run(["/path/to/reset_script.sh"])
-    send_discord_message(f"Subtensor reset initiated at {get_local_ip()}")
-
-# Main monitoring loop
-def monitor_subtensor():
-    firewall_active = False
-
-    while True:
-        try:
-            # Get block numbers
-            local_block = get_block_number_with_custom_timeout(LOCAL_URL)
-            subvortex_block = get_block_number_with_custom_timeout(SUBVORTEX_URL)
-            finney_block = get_block_number_with_custom_timeout(FINNEY_NETWORK)
-            print(f"Local block: {local_block}, Subvortex block: {subvortex_block}, Finney block: {finney_block}")
-            
-            # Find max external block
-            external_blocks = [b for b in [subvortex_block, finney_block] if b is not None]
-            if not external_blocks:
-                # If neither external node is available, wait and retry
-                time.sleep(CHECK_INTERVAL)
+            if local_block is None:
+                self.report_to_discord(f"Error: Local subtensor block could not be fetched.")
+                self.logger.error("Error: Local subtensor block could not be fetched.")
+                await asyncio.sleep(12)
                 continue
 
-            max_external_block = max(external_blocks)
+            # Max block of external nodes (finney and subvortex)
+            if finney_block is None or subvortex_block is None:
+                # Retry if either external node is unreachable
+                await asyncio.sleep(12)
+                continue
 
-            # Check local block progress
-            if local_block is None or max_external_block - local_block >= 2:
-                # Block is behind or cannot read block
-                if not firewall_active:
-                    firewall_subtensor_allow_local()
-                    reset_subtensor()
-                    firewall_active = True
+            max_external_block = max([finney_block, subvortex_block])
 
-            elif firewall_active and local_block >= max_external_block - 1:
-                # Local block caught up, remove firewall
-                remove_firewall()
-                firewall_active = False
+            if max_external_block - local_block > self.block_behind_threshold:
+                if not is_firewalled:
+                    self.firewall.block_port()
+                    is_firewalled = True
+                    self.report_to_discord(f"Firewall applied, local subtensor is {max_external_block - local_block} blocks behind.")
+                    self.logger.warning(f"Firewall applied, local subtensor is {max_external_block - local_block} blocks behind.")
 
+            if is_firewalled and local_block >= max_external_block - 1:
+                self.firewall.unblock_port()
+                is_firewalled = False
+                self.report_to_discord("Firewall removed, local subtensor has caught up.")
+                self.logger.info("Firewall removed, local subtensor has caught up.")
+
+            if is_firewalled:
+                # If firewalled, check if block hasn't increased and reset the subtensor
+                previous_local_block = local_block
+                await asyncio.sleep(12)
+                local_block = await self.get_block_number(self.local_address)
+                if local_block is not None and local_block == previous_local_block:
+                    self.report_to_discord(f"Local subtensor stuck at block {local_block}, resetting subtensor.")
+                    self.reset_subtensor()
+
+            await asyncio.sleep(12)
+
+    def reset_subtensor(self):
+        try:
+            os.system(self.reset_script)
+            self.report_to_discord(f"Executed reset script: {self.reset_script}")
+            self.logger.info(f"Executed reset script: {self.reset_script}")
         except Exception as e:
-            logging.error(f"Error during monitoring: {e}")
-        
-        time.sleep(CHECK_INTERVAL)
+            self.report_to_discord(f"Error executing reset script: {e}")
+            self.logger.exception(f"Error executing reset script: {e}")
 
-if __name__ == '__main__':
-    monitor_subtensor()
+    def report_to_discord(self, message):
+        try:
+            ip_address = socket.gethostbyname(socket.gethostname())
+            full_message = f"[{ip_address}] {message}"
+            requests.post(self.discord_webhook_url, json={"content": full_message})
+        except Exception as e:
+            self.logger.exception(f"Failed to send message to Discord: {e}")
+
+
+if __name__ == "__main__":
+    discord_webhook_url = "YOUR_DISCORD_WEBHOOK_URL"
+
+    monitor = SubtensorMonitor(discord_webhook_url)
+    asyncio.run(monitor.monitor_subtensor())
