@@ -7,6 +7,8 @@ authors = [
 ]
 dependencies = [
     "bittensor>=8.0.0",
+    "requests>=2.32.3",
+    "docker>=7.1.0",
 ]
 requires-python = ">=3.10"
 readme = "README.md"
@@ -18,4 +20,35 @@ build-backend = "pdm.backend"
 
 
 [tool.pdm]
-distribution = true
+distribution = false
+
+[tool.pdm.dev-dependencies]
+test = [
+    "pytest>=8.3.3",
+]
+lint = [
+    "ruff>=0.6.9",
+]
+
+[tool.ruff]
+src = ["app/src"]
+line-length = 120
+
+[tool.ruff.lint]
+# TODO add D
+select = [
+    "E", "F", "I", "UP", "S",
+    "TCH005",
+]
+# TODO: remove E501 once docstrings are formatted
+ignore = [
+    "D100", "D105", "D107", "D200", "D202", "D203", "D205", "D212", "D400", "D401", "D415",
+    "D101", "D102","D103", "D104", # TODO remove once we have docstring for all public methods
+    "E501", # TODO: remove E501 once docstrings are formatted
+    "S101", "S108", "S603", "S607",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+"**/test*/**.py" = ["D", "F403", "F405", "S106", "S311"]
+
