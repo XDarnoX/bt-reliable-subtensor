@@ -28,7 +28,7 @@ class FirewallManager:
                 "-s",
                 "127.0.0.1",
                 "-j",
-                "DROP",
+                "REJECT",
             ],
             capture_output=True,
             check=False,
@@ -49,7 +49,7 @@ class FirewallManager:
                 "-s",
                 "127.0.0.1",
                 "-j",
-                "DROP",
+                "REJECT",
             ],
             capture_output=True,
             check=False,
@@ -222,7 +222,6 @@ class SubtensorMonitor:
             if is_firewalled and local_block >= max_external_block - 1:
                 self.firewall.unblock_port()
                 is_firewalled = False
-                local_block = local_block - 1120
                 self.report_to_discord("Firewall removed, local subtensor has caught up.")
                 self.logger.info("Firewall removed, local subtensor has caught up.")
 
