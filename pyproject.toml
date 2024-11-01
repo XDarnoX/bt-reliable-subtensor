@@ -9,10 +9,25 @@ dependencies = [
     "bittensor>=8.0.0",
     "requests>=2.32.3",
     "docker>=7.1.0",
+    "python-dotenv>=1.0.1",
+    "watchdog>=5.0.3",
+    "tenacity>=9.0.0",
+    "aioresponses>=0.7.6",
+    "nox>=2024.10.9",
+    "nox-pdm>=0.0.2",
 ]
 requires-python = ">=3.10"
 readme = "README.md"
 license = {text = "MIT"}
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "codespell",
+    "mypy",
+    "pytest",
+    "aioresponses",
+]
 
 [build-system]
 requires = ["pdm-backend"]
@@ -40,6 +55,7 @@ select = [
     "E", "F", "I", "UP", "S",
     "TCH005",
 ]
+
 # TODO: remove E501 once docstrings are formatted
 ignore = [
     "D100", "D105", "D107", "D200", "D202", "D203", "D205", "D212", "D400", "D401", "D415",

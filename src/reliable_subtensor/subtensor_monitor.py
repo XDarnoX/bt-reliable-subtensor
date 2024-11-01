@@ -1,252 +1,351 @@
+"""
+This module provides the `SubtensorMonitor` class, which is responsible for monitoring
+Subtensor nodes, managing firewall rules, and performing auto-healing operations on the
+Subtensor network. It interacts with Docker containers and volumes to ensure the Subtensor
+node is running optimally and securely. Additionally, it sends notifications to Discord
+channels to report the status and any issues encountered during monitoring.
+"""
+
 import asyncio
-import json
 import logging
 import socket
-import subprocess
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional
 
-import docker
-import requests
+import aiohttp
+from aiohttp import ClientConnectionError, ClientResponseError, ClientTimeout
 from bittensor import subtensor
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from src.reliable_subtensor.config import MonitorConfig, configure_logging, load_and_validate_config
+from src.reliable_subtensor.docker_manager import DockerManager
+from src.reliable_subtensor.firewall_manager import FirewallManager
 
 
-class FirewallManager:
-    def __init__(self, port: int = 9944):
-        self.port = port
+class MonitorState(Enum):
+    SYNCING = auto()
+    BEHIND = auto()
+    CAUGHT_UP = auto()
+    UNAVAILABLE = auto()
 
-    def block_port(self):
-        # Block external access to port 9944, but allow localhost (127.0.0.1)
-        subprocess.run(
-            [
-                "iptables",
-                "-I",
-                "DOCKER-USER",
-                "-p",
-                "tcp",
-                "--dport",
-                str(self.port),
-                "!",
-                "-s",
-                "127.0.0.1",
-                "-j",
-                "REJECT",
-            ],
-            capture_output=True,
-            check=False,
-        )
 
-    def unblock_port(self):
-        # Unblock port 9944 to allow external access again
-        subprocess.run(
-            [
-                "iptables",
-                "-D",
-                "DOCKER-USER",
-                "-p",
-                "tcp",
-                "--dport",
-                str(self.port),
-                "!",
-                "-s",
-                "127.0.0.1",
-                "-j",
-                "REJECT",
-            ],
-            capture_output=True,
-            check=False,
-        )
+@dataclass
+class NodeState:
+    name: str
+    url: str
+    block_number: int | None = None
+    previous_block_number: int | None = None
+    last_update_time: float = field(default_factory=lambda: asyncio.get_event_loop().time())
+
+    def update_block(self, new_block: int | None):
+        self.previous_block_number = self.block_number
+        self.block_number = new_block
+        self.last_update_time = asyncio.get_event_loop().time()
 
 
 class SubtensorMonitor:
-    def __init__(
-        self,
-        discord_webhook_url: str,
-        subtensor_container_name: str,
-        subtensor_volume_name: str,
-        local_url: str,
-        finney_url: str,
-        subvortex_url: str,
-    ):
-        self.local_port = local_url.split(":")[-1]
+    def __init__(self, config: MonitorConfig):
+        self.config = config
 
-        self.firewall = FirewallManager(self.local_port)
-        self.discord_webhook_url = discord_webhook_url
-        self.local_url = local_url
-        self.finney_url = finney_url
-        self.subvortex_url = subvortex_url
-        self.block_behind_threshold = 2  # Threshold for block lagging
-        self.syncing_detected = False
-        self.stuck_threshold = 60  # 1 minute threshold for stuck detection
-        self.previous_local_block = None
-        self.previous_finney_block = None
-        self.previous_subvortex_block = None
-        self.stuck_start_time = None
-        self.docker_client = docker.from_env()
-        self.subtensor_container_name = subtensor_container_name
-        self.subtensor_volume_name = subtensor_volume_name
+        self.local_node = NodeState(name="Local", url=config.local_url)
+        self.finney_node = NodeState(name="Finney", url=config.finney_url)
+        self.subvortex_node = NodeState(name="Subvortex", url=config.subvortex_url)
+        self.nodes = [self.local_node, self.finney_node, self.subvortex_node]
 
-        # Configure logging
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        console_handler.setFormatter(formatter)
-        self.logger.addHandler(console_handler)
+        self.monitor_state = MonitorState.CAUGHT_UP
+        self.stuck_start_time: float | None = None
+        self.syncing_start_time: float | None = None
+        self.last_external_check_time: float = asyncio.get_event_loop().time()
+        self.is_firewalled = False
 
-    async def get_block_number(self, network):
-        try:
-            block = subtensor(network=network).block
-            return block
-        except Exception as e:
-            self.report_to_discord(f"Error fetching block from {network}: {e}")
-            self.logger.exception(f"Error fetching block from {network}: {e}")
-            return None
+        local_port = int(config.local_url.split(":")[-1])
+        self.firewall = FirewallManager(port=local_port)
+        self.docker_manager = DockerManager(config.subtensor_container_name, config.subtensor_volume_name)
 
-    async def fetch_all_blocks(self):
-        tasks = [
-            self.get_block_number(self.local_url),
-            self.get_block_number(self.finney_url),
-            self.get_block_number(self.subvortex_url),
-        ]
+        self.logger = logging.getLogger("SubtensorMonitor")
+
+    async def monitor_subtensor(self):
+        while True:
+            await self.update_node_states()
+            await self.determine_monitor_state()
+            await self.handle_monitor_state()
+            await asyncio.sleep(12)
+
+    async def update_node_states(self):
+        current_time = asyncio.get_event_loop().time()
+        time_since_last_check = current_time - self.last_external_check_time
+
+        if self.monitor_state == MonitorState.BEHIND or time_since_last_check >= self.config.external_check_interval:
+            nodes_to_update = self.nodes
+            self.last_external_check_time = current_time
+            self.logger.debug("Performing external block comparison with Finney/Subvortex.")
+        else:
+            nodes_to_update = [self.local_node]
+            self.logger.debug("Performing local block update only.")
+
+        block_numbers = await self.fetch_blocks(nodes_to_update)
+        for node, block_number in zip(nodes_to_update, block_numbers):
+            node.update_block(block_number)
+            self.logger.info(f"{node.name} block number updated to {block_number}")
+
+    async def fetch_blocks(self, nodes: list[NodeState]) -> list[int | None]:
+        tasks = [self.get_block_number(node) for node in nodes]
         return await asyncio.gather(*tasks)
-    
-    def is_syncing(self):
-        payload = {"jsonrpc": "2.0", "method": "system_health", "params": [], "id": 1}
-        headers = {"Content-Type": "application/json"}
-        rpc_endpoint = self.local_url.replace("ws://", "http://").replace("wss://", "https://")
 
-        response = requests.post(rpc_endpoint, headers=headers, data=json.dumps(payload), timeout=30)
-        if response.status_code == 200:
-            result = response.json()
-            if "result" in result and "isSyncing" in result["result"]:
-                is_syncing = result["result"]["isSyncing"]
-                if is_syncing:
-                    return True
-                else:
-                    return False
-        raise Exception(f"Failed to fetch system health data.{response.text}")
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((Exception,)),
+        reraise=True,
+    )
+    async def get_block_number(self, node: NodeState) -> int | None:
+        try:
+            block = await asyncio.wait_for(asyncio.to_thread(lambda: subtensor(network=node.url).block), timeout=10)
+            return block
+        except asyncio.TimeoutError:
+            self.logger.error(f"Timeout fetching block from {node.name} subtensor after retries")
+        except Exception as e:
+            self.logger.exception(f"Error fetching block from {node.name} subtensor: {e}")
+        return None
+
+    async def determine_monitor_state(self):
+        if self.local_node.block_number is None or self.local_node.previous_block_number is None:
+            self.set_monitor_state(
+                new_state=MonitorState.UNAVAILABLE,
+                message="Local subtensor block number is None. Setting state to UNAVALIABLE.",
+                log_level="error",
+            )
+            return
+        
+        try:
+            is_syncing = await self.is_syncing()
+        except Exception as e:
+            self.set_monitor_state(
+                new_state=MonitorState.UNAVAILABLE,
+                message=f"Local subtensor node is unavailable due to syncing error: {e}. Setting state to UNAVAILABLE.",
+                log_level="error",
+            )
+            return
+
+        if is_syncing:
+            self.set_monitor_state(
+                new_state=MonitorState.SYNCING,
+                message="Local subtensor node is syncing. Setting state to SYNCING.",
+            )
+            return
+
+        block_increment = self.local_node.block_number - self.local_node.previous_block_number
+        self.logger.debug(f"Local block increment: {block_increment}")
+
+        if block_increment == 0:
+            self.log_and_report("Local block has not incremented. Performing external check.", log_level="debug")
+            new_monitor_state, log_level = await self.perform_external_check()
+            if new_monitor_state is not None and new_monitor_state != self.monitor_state:
+                self.set_monitor_state(
+                    new_state=new_monitor_state,
+                    message=f"Setting state to {new_monitor_state.name} after external nodes comparison.",
+                    log_level=log_level,
+                )
+            return
+
+        if self.monitor_state != MonitorState.CAUGHT_UP:
+            self.set_monitor_state(
+                new_state=MonitorState.CAUGHT_UP,
+                message="Node has caught up. Setting state to CAUGHT_UP.",
+            )
+
+    def set_monitor_state(self, new_state: MonitorState, message: str, log_level: str = "info"):
+        if self.monitor_state != new_state:
+            self.monitor_state = new_state
+            self.log_and_report(message, log_level)
+
+    async def perform_external_check(self) -> tuple[Optional[MonitorState], str]:
+        try:
+            external_nodes = [self.finney_node, self.subvortex_node]
+            block_numbers = await self.fetch_blocks(external_nodes)
+            
+            for node, block_number in zip(external_nodes, block_numbers):
+                node.update_block(block_number)
+                self.logger.info(f"{node.name} block number updated to {block_number}")
+
+            external_blocks = [node.block_number for node in external_nodes if node.block_number is not None]
+            if not external_blocks:
+                self.logger.warning("Cannot determine if node is behind due to missing external block data.")
+                return None, None
+
+            max_external_block = max(external_blocks)
+            block_difference = max_external_block - self.local_node.block_number
+            self.logger.debug(f"Block difference after external check: {block_difference}")
+
+            if block_difference >= self.config.block_behind_threshold:
+                return MonitorState.BEHIND, "warning"
+
+            return MonitorState.CAUGHT_UP, "info"
+        except Exception as e:
+            self.log_and_report(f"External check failed: {e}", log_level="exception")
+            return None, None
+
+    async def handle_monitor_state(self):
+        if self.monitor_state == MonitorState.SYNCING:
+            await self.handle_syncing_state()
+        elif self.monitor_state == MonitorState.BEHIND:
+            await self.handle_behind_state()
+        elif self.monitor_state == MonitorState.CAUGHT_UP:
+            await self.handle_caught_up_state()
+        elif self.monitor_state == MonitorState.UNAVAILABLE:
+            await self.handle_unavailable_state()
+
+    async def handle_syncing_state(self):
+        if not self.is_firewalled:
+            self.firewall.apply_firewall()
+            self.is_firewalled = True
+            self.log_and_report("Node is syncing. Firewall applied.", log_level="info")
+
+        if self.syncing_start_time is None:
+            self.syncing_start_time = asyncio.get_event_loop().time()
+            self.logger.info(f"Node started syncing at {self.syncing_start_time}.")
+        else:
+            elapsed_time = asyncio.get_event_loop().time() - self.syncing_start_time
+            self.logger.debug(f"Node has been syncing for {elapsed_time} seconds.")
+            if elapsed_time > self.config.syncing_threshold:
+                self.log_and_report("Node has been syncing for too long. Initiating auto-heal.", log_level="error")
+                try:
+                    self.auto_heal_subtensor()
+                    self.syncing_start_time = None
+                except Exception:
+                    self.log_and_report("Auto-heal failed during syncing state. Will retry in the next cycle.", log_level="exception")
+
+    async def handle_behind_state(self):
+        if not self.is_firewalled:
+            self.firewall.apply_firewall()
+            self.is_firewalled = True
+            self.log_and_report("Node is behind. Firewall applied.", log_level="warning")
+
+            external_blocks = list(filter(None, [self.finney_node.block_number, self.subvortex_node.block_number]))
+            if external_blocks and self.local_node.block_number is not None:
+                max_external_block = max(external_blocks)
+                block_difference = max_external_block - self.local_node.block_number
+                self.log_and_report(f"Node is behind by {block_difference} blocks.", log_level="warning")
+            else:
+                self.log_and_report(
+                    "Unable to determine block difference due to missing block data.",
+                    log_level="error",
+                )
+
+        self.syncing_start_time = None
+        await self.check_for_stuck_node()
+
+    async def handle_unavailable_state(self):
+        if not self.is_firewalled:
+            self.firewall.apply_firewall()
+            self.is_firewalled = True
+            self.log_and_report("Node is unavailable. Firewall applied.", log_level="error")
+        await self.check_for_stuck_node()
+        
+
+    async def handle_caught_up_state(self):
+        if self.is_firewalled:
+            self.firewall.remove_firewall()
+            self.is_firewalled = False
+            self.log_and_report("Node has caught up. Firewall removed.")
+        self.stuck_start_time = None
+
+    async def check_for_stuck_node(self):
+        is_stuck = self.local_node.block_number is None or self.local_node.block_number == self.local_node.previous_block_number
+        if is_stuck:
+            if self.stuck_start_time is None:
+                self.stuck_start_time = asyncio.get_event_loop().time()
+                self.logger.warning(f"Node appears stuck at block: {self.local_node.block_number}.")
+            elif asyncio.get_event_loop().time() - self.stuck_start_time > self.config.stuck_threshold:
+                self.log_and_report("Node is stuck. Initiating auto-heal.", log_level="error")
+                try:
+                    self.auto_heal_subtensor()
+                    self.stuck_start_time = None
+                except Exception:
+                    self.logger.exception("Auto-heal failed. Will retry in the next cycle.")
+        else:
+            self.stuck_start_time = None
 
     def auto_heal_subtensor(self):
         try:
-            subtensor_container = self.docker_client.containers.get(self.subtensor_container_name)
-            subtensor_container.stop()
-            self.logger.info(f"Stopped container {self.subtensor_container_name}.")
+            container = self.docker_manager.get_container()
+            volume = self.docker_manager.get_volume()
 
-            subtensor_container.remove(force=True)
+            self.docker_manager.stop_container(container)
+            self.docker_manager.remove_container(container)
+            self.docker_manager.remove_volume(volume)
 
-            subtensor_volume = self.docker_client.volumes.get(self.subtensor_volume_name)
-            subtensor_volume.remove(force=True)
+            self.docker_manager.create_volume()
+            self.docker_manager.wait_for_volume()
+            self.docker_manager.run_container(container)
 
-            port_bindings = subtensor_container.attrs["HostConfig"].get("PortBindings", {})
-            ports = {port: port.split("/")[0] for port in port_bindings}
-            volume = self.subtensor_container_name + ":" + subtensor_container.attrs["Mounts"][0]["Destination"]
-            self.docker_client.containers.run(
-                image=subtensor_container.image.tags[0],
-                name=subtensor_container.name,
-                detach=True,
-                cpu_count=subtensor_container.attrs["HostConfig"]["CpuCount"],
-                mem_limit=subtensor_container.attrs["HostConfig"]["Memory"],
-                memswap_limit=subtensor_container.attrs["HostConfig"]["MemorySwap"],
-                ports=ports,
-                environment=subtensor_container.attrs["Config"]["Env"],
-                volumes=[volume],
-                command=subtensor_container.attrs["Config"]["Cmd"],
-                network=subtensor_container.attrs["HostConfig"]["NetworkMode"],
-            )
-
-            self.report_to_discord("Subtensor auto-healed (container restarted and volume wiped).")
-            self.logger.info("Subtensor auto-healed (container restarted and volume wiped).")
-        except docker.errors.NotFound:
-            self.report_to_discord("Subtensor container or volume not found.")
-            self.logger.error("Subtensor container or volume not found.")
         except Exception as e:
-            self.report_to_discord(f"Auto-healing failed: {e}")
-            self.logger.exception(f"Auto-healing failed: {e}")
+            self.log_and_report(f"Auto-heal failed: {e}", log_level="exception")
+            raise
 
-    def report_to_discord(self, message):
+    def log_and_report(self, message, log_level="info"):
+        log_func = getattr(self.logger, log_level)
+        log_func(message)
+        asyncio.create_task(self._report_to_discord(message))
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(Exception),
+        reraise=False
+    )
+    async def _report_to_discord(self, message):
         try:
             ip_address = socket.gethostbyname(socket.gethostname())
             full_message = f"[{ip_address}] {message}"
-            requests.post(self.discord_webhook_url, json={"content": full_message}, timeout=30)
+            asyncio.create_task(self.send_discord_message(full_message))
         except Exception as e:
             self.logger.exception(f"Failed to send message to Discord: {e}")
 
-    async def monitor_subtensor(self):
-        is_firewalled = False
-        while True:
-            local_block, finney_block, subvortex_block = await self.fetch_all_blocks()
+    async def send_discord_message(self, message):
+        try:
+            async with aiohttp.ClientSession() as session:
+                webhook_url = self.config.discord_webhook_url
+                payload = {"content": message}
+                async with session.post(webhook_url, json=payload, timeout=10) as response:
+                    if response.status != 204:
+                        raise ClientResponseError(response.request_info, response.history, status=response.status)
+        except Exception as e:
+            raise e
 
-            if local_block is None:
-                self.report_to_discord("Error: Local subtensor block could not be fetched.")
-                self.logger.error("Error: Local subtensor block could not be fetched.")
-                await asyncio.sleep(12)
-                continue
+    async def is_syncing(self) -> bool:
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {"jsonrpc": "2.0", "method": "system_health", "params": [], "id": 1}
+                rpc_endpoint = self.local_node.url.replace("ws://", "http://").replace("wss://", "https://")
 
-            # Max block of external nodes (finney and subvortex)
-            if finney_block is None or subvortex_block is None:
-                await asyncio.sleep(12)
-                continue
+                timeout = ClientTimeout(total=10)
+                async with session.post(rpc_endpoint, json=payload, timeout=timeout) as response:
+                    response.raise_for_status()
+                    result = await response.json()
+                    is_syncing = result.get("result", {}).get("isSyncing", False)
+                    return is_syncing
+        except (ClientConnectionError, ClientResponseError, asyncio.TimeoutError) as e:
+            self.logger.exception(f"Network-related error when checking syncing status: {e}")
+            raise e
+        except Exception as e:
+            self.logger.exception(f"Exception when checking syncing status: {e}")
+            return e
 
-            self.logger.info(
-                f"Local block: {local_block}, Finney block: {finney_block}, Subvortex block: {subvortex_block}"
-            )
 
-            if self.is_syncing():
-                if not self.syncing_detected:
-                    self.firewall.block_port()
-                    self.syncing_detected = True
-                self.report_to_discord("Node is syncing, skipping block comparison.")
-                self.logger.warning("Node is syncing, skipping block comparison.")
-                await asyncio.sleep(12)
-                continue
-            else:
-                if self.syncing_detected:
-                    self.firewall.unblock_port()
-                    self.report_to_discord("State sync is complete, firewall removed.")
-                    self.logger.info("State sync is complete, firewall removed.")
-                self.syncing_detected = False
+if __name__ == "__main__":
+    logger = configure_logging()
+    logger.info("SubtensorMonitor script is starting...")
 
-            max_external_block = max([finney_block, subvortex_block])
+    try:
+        config = load_and_validate_config()
+    except ValueError as e:
+        logger.error(e)
+        exit(1)
 
-            if max_external_block - local_block > self.block_behind_threshold:
-                if not is_firewalled:
-                    self.firewall.block_port()
-                    is_firewalled = True
-                    self.report_to_discord(
-                        f"Firewall applied, local subtensor is {max_external_block - local_block} blocks behind."
-                    )
-                    self.logger.warning(
-                        f"Firewall applied, local subtensor is {max_external_block - local_block} blocks behind."
-                    )
-
-            if is_firewalled and local_block >= max_external_block - 1:
-                self.firewall.unblock_port()
-                is_firewalled = False
-                self.report_to_discord("Firewall removed, local subtensor has caught up.")
-                self.logger.info("Firewall removed, local subtensor has caught up.")
-
-            if is_firewalled:
-                if (
-                    local_block == self.previous_local_block
-                    and self.previous_finney_block < finney_block
-                    and self.previous_subvortex_block < subvortex_block
-                ):
-                    if self.stuck_start_time is None:
-                        self.stuck_start_time = asyncio.get_event_loop().time()
-                        self.logger.warning(
-                            f"Local subtensor stuck at block {local_block}, waiting for {self.stuck_threshold} seconds."
-                        )
-                    elif asyncio.get_event_loop().time() - self.stuck_start_time > self.stuck_threshold:
-                        self.report_to_discord(f"Local subtensor stuck at block {local_block}, resetting subtensor.")
-                        # Subtensor is stuck for over a minute, trigger auto-healing
-                        self.auto_heal_subtensor()
-                        self.stuck_start_time = None
-                else:
-                    self.stuck_start_time = None
-
-                self.previous_local_block = local_block
-                self.previous_finney_block = finney_block
-                self.previous_subvortex_block = subvortex_block
-
-            await asyncio.sleep(12)
-
+    monitor = SubtensorMonitor(config)
+    try:
+        asyncio.run(monitor.monitor_subtensor())
+    except Exception:
+        logger.exception("Exception occurred during SubtensorMonitor execution.")
