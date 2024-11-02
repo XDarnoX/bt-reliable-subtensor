@@ -1,8 +1,8 @@
-# Subtensor Monitor
+# Reliable Subtensor
 
 ## Overview
 
-**Subtensor Monitor** is a robust and automated monitoring solution designed to ensure the optimal performance and security of Subtensor nodes. This tool provides comprehensive oversight and automated recovery mechanisms to maintain the health and integrity of the Subtensor node.
+**Reliable Subtensor** is a robust and automated monitoring solution designed to ensure the optimal performance and security of Subtensor nodes. This tool provides comprehensive oversight and automated recovery mechanisms to maintain the health and integrity of the Subtensor node.
 
 ## Features
 
