@@ -12,7 +12,7 @@ RUN pdm config python.use_venv False && \
     pdm sync --prod
 RUN mkdir -p /opt/ && mv __pypackages__/3.11/ /opt/pypackages/
 ENV PATH=/opt/pypackages/bin:$PATH
-ENV PYTHONPATH=/opt/pypackages/lib:$PYTHONPATH
+ENV PYTHONPATH=/usr/src/app/src:/opt/pypackages/lib:$PYTHONPATH
 
 COPY . .
 RUN chmod +x ./subtensor_monitor_launcher.py

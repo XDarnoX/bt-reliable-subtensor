@@ -29,11 +29,12 @@ def lint(session):
 def typecheck(session):
     session.run_always('pdm', 'install', '-G', 'test', external=True)
     session.install("mypy")
-    session.run("mypy", *CODE_LOCATIONS)
+    session.run("mypy", "--explicit-package-bases", *CODE_LOCATIONS)
 
 @nox.session(name="tests", python=PYTHON_DEFAULT_VERSION)
 def tests(session):
     """Run tests with pytest."""
     session.run_always('pdm', 'install', '-G', 'test', external=True)
+    session.install("-e", ".")
     session.install("pytest")
     session.run("pytest", "--tb=short", *CODE_LOCATIONS)

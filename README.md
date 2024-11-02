@@ -13,6 +13,7 @@ Subtensor Monitor continuously monitors the state of your Subtensor node by trac
 - **SYNCING:** The node is actively synchronizing with the network.
 - **BEHIND:** The node has fallen behind the latest blocks.
 - **CAUGHT_UP:** The node is fully synchronized with the network.
+- **UNAVAILABLE:** The node is unreachable or not responding, indicating potential downtime or connectivity issues.
 
 **Logic Behind State Detection:**
 
@@ -24,7 +25,7 @@ Subtensor Monitor continuously monitors the state of your Subtensor node by trac
 
 Stay informed in real-time with automated Discord notifications that alert you to critical events and state changes:
 
-- **State Changes:** Receive updates when the node transitions between SYNCING, BEHIND, and CAUGHT_UP states.
+- **State Changes:** Receive updates when the node transitions between SYNCING, BEHIND, CAUGHT_UP and UNAVAILABLE states.
 - **Error Alerts:** Get notified of any errors encountered during monitoring, firewall management, or auto-healing processes.
 - **Recovery Actions:** Alerts when auto-healing procedures are initiated or successfully completed.
 
